@@ -225,6 +225,104 @@ python main.py -d ../data/metadata.txt
 | `pybind11Config.cmake` 找不到                     | 没在 conda 环境 / 没传路径          | 激活环境；传 `-Dpybind11_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')"`                                                   |
 | DART 仍指向 `/usr/include`                        | 找到了 apt 版                   | 指定 `-DDART_DIR=/usr/local/share/dart/cmake`，必要时 `export CMAKE_PREFIX_PATH=/usr/local:$CMAKE_PREFIX_PATH`                                    |
 
+
+
+# 🔧 补充 1：先装 apt 版 DART → 发现问题 → 直接改为源码编译
+
+**你实际的过程（建议也这样写进笔记里）：**
+
+* **先用 apt 安装了系统自带的 DART 6.13**（以及 Boost/Assimp/GL 等依赖），随后按需补装了 DART 的组件：
+
+  * `libdart-collision-bullet6.13` / `libdart-collision-bullet-dev`（Bullet 碰撞）
+  * `libdart-utils-urdf-dev`（URDF）
+  * `libdart-external-ikfast-dev`（ikfast 头文件）
+  * 还有 `libboost-all-dev` 等
+
+* 这样可以先把 **核心库** 和 **Python 扩展（pymss）** 编译通过；
+  但 **render** 阶段报 `dart/gui/glut/*.hpp` 缺失（apt 包常见缺头问题），即使 FreeGLUT 在，也会卡。
+
+* **未继续纠结 apt 版**，直接切换到 **源码编译 DART 6.13（带 GUI+Bullet）** 并安装到 `/usr/local`：
+
+  ```bash
+  git clone https://github.com/dartsim/dart.git
+  cd dart && git checkout v6.13.2 -b v6.13.2-local
+  mkdir build && cd build
+  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+           -DDART_BUILD_GUI=ON -DDART_BUILD_COLLISION_BULLET=ON \
+           -DDART_BUILD_EXAMPLES=OFF -DDART_BUILD_TESTS=OFF -DDART_BUILD_TUTORIALS=OFF
+  make -j"$(nproc)"
+  sudo make install
+  ```
+
+* **回到 MASS** 时，**一定要指向** `/usr/local` 这套：
+
+  ```bash
+  cmake .. -DDART_DIR=/usr/local/share/dart/cmake  ...
+  ```
+
+  这样 `render` 也能顺利编过（因为 `/usr/local/include/dart/gui/glut/*.hpp` 都齐）。
+
+> 小备注：你写的“补充编译了 plot 成功”应是笔误，实际是 **补齐了 Bullet/ikfast 等组件**，但没再验证 apt 版 render，**直接改为源码 DART**（这是对的，省时省心）。
+
 ---
 
-需要我把你当前仓库的 `CMakeLists.txt` 做一次最小改动的 patch（只加 C++17 的两行）吗？你把三个 CMakeLists（根、core、render、python）贴上来，我给你打一个干净的补丁，后续拉别人代码也能直接套。
+# 🧪 补充 2：检查标准版本 & 三个 CMakeLists 都要加 C++17
+
+**先让 CMake 生成编译数据库**（方便排查 `-std=`）：
+
+```bash
+cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=ON  ...
+```
+
+**检查实际使用的 C++ 标准**（看是否混用 11/17）：
+
+```bash
+grep -o -- '-std=[^ "]\+' build/compile_commands.json | sort -u
+# 理想只剩：-std=gnu++17
+# 你当时看到的是同时有 -std=gnu++11 和 -std=gnu++17
+```
+
+**为避免某些目标仍被旧设置覆盖，分别在三个 CMakeLists 里强制 C++17：**
+
+1. `core/CMakeLists.txt`（`add_library(mss ...)` 之后）：
+
+```cmake
+target_compile_features(mss PUBLIC cxx_std_17)
+target_compile_options(mss PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>)
+```
+
+2. `render/CMakeLists.txt`（`add_executable(render ...)` 之后）：
+
+```cmake
+target_compile_features(render PUBLIC cxx_std_17)
+target_compile_options(render PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>)
+```
+
+3. `python/CMakeLists.txt`（`pybind11_add_module(pymss ...)` 之后）：
+
+```cmake
+target_compile_features(pymss PUBLIC cxx_std_17)
+target_compile_options(pymss PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>)
+```
+
+> 说明：
+>
+> * `target_compile_features(... cxx_std_17)` 让 CMake 知道要 17；
+> * `target_compile_options(... -std=gnu++17)` **把 `-std=gnu++17` 追加到命令行最后**，覆盖掉任何早先遗留的 `-std=gnu++11/14`。
+> * 你也可以在顶层 `CMakeLists.txt` 兜底：
+>
+>   ```cmake
+>   set(CMAKE_CXX_STANDARD 17)
+>   set(CMAKE_CXX_STANDARD_REQUIRED ON)
+>   set(CMAKE_CXX_EXTENSIONS ON)  # 给 GCC 走 gnu++17；如果想纯 c++17 改成 OFF
+>   ```
+
+**再次验证：**
+
+```bash
+rm -rf build && mkdir build && cd build
+cmake .. -DDART_DIR=/usr/local/share/dart/cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ...
+grep -o -- '-std=[^ "]\+' compile_commands.json | sort -u
+# 只应剩下 -std=gnu++17
+```
+
